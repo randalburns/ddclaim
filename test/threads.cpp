@@ -15,8 +15,6 @@
 #include <thread>
 #include <vector>
 
-#include <pthread.h>
-#include <sched.h>
 
 #include "ddclaim.hpp"
 
@@ -30,11 +28,7 @@ int main(int argc, char** argv) {
       if (*c) c++;
     }
   auto pin = [&](int t) {
-    if (cpus.empty()) return;
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    CPU_SET(cpus[static_cast<size_t>(t) % cpus.size()], &set);
-    pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+    if (!cpus.empty()) ddclaim::pin_thread(cpus[static_cast<size_t>(t) % cpus.size()]);
   };
   ddclaim::init();
   pin(0);

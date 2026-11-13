@@ -188,3 +188,51 @@ is needed for seven cards); 6 or 12 coroutines (no change).
 The table files are now read into anonymous huge pages at init by default, the faster of the
 two ways measured (353,600 against 323,400 six-card positions/s on an unseen seed). Set
 `OPEN1_MAP=1` to memory-map the files instead; `OPEN1_COPY` is no longer read.
+
+## Third round: a better first guess (in ddclaim)
+
+Questions per position on random endings (bench seed 1), and speed with
+`taskset -c 2 bin/bench <cards> <positions> 1 3`, old and new run alternately on a machine
+with some other load:
+
+| Cards | Questions before | Questions after | Floor | Positions/s before | Positions/s after |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 1.98 | 1.72 | 1.68 | 4,840,000 | 5,740,000 to 5,830,000 |
+| 5 | 2.07 | 1.83 | 1.76 | 1,220,000 to 1,280,000 | 1,220,000 to 1,380,000 |
+| 6 | 2.15 | 1.92 | 1.83 | 344,000 to 352,000 | 358,000 to 379,000 (390,000 to 392,000 when quiet) |
+| 7 | 2.24 | 1.99 | 1.87 | 101,000 to 102,000 | 108,000 |
+
+"Before" questions for 4, 5 and 7 cards and all the floors are from the offline simulation
+(which reproduces the measured 2.15 at six cards); "after" is counted by the solver. The
+floor is a perfect guess: two questions, one when the value is 0 or all the tricks.
+Searched positions per six-card position fell from 84 to 78.
+
+Two changes, both only in which target is asked first:
+
+1. **Where to start.** Starting at target t costs two questions when the value is t or
+   t - 1, so the first target should be floor(estimate) + 1, not round(estimate). With the
+   old estimate alone this gives 2.07 questions at six cards instead of 2.15.
+2. **A better estimate.** An additive model of the leader's side's tricks: one table entry
+   per suit, keyed on the suit's length in each hand (leader-relative, capped at 3) and
+   which side holds each of its top four cards (4,096 keys; separate entries for a side
+   suit and the trump suit), plus a term for the difference in trump length. Separate
+   tables for no trumps and trumps and for 4, 5, 6 and 7 cards, 16-bit weights, 173 KB of
+   source (`src/guess_tables.inc`). Fitted by least squares on random endings solved by
+   ddclaim itself (3M six-card, 2M five-card, 1.5M four-card, 0.6M seven-card; its own
+   generator): `tools/guess/dump.cpp` writes the data, `tools/guess/export.py` fits and
+   writes the tables. Root-mean-square error 0.60 tricks at six cards against 0.84 for the
+   old linear fit; the value is the first target or one less in 91% of positions (71%
+   before). Sizes 1 to 3 keep the old guess (they are table lookups anyway).
+
+No table file changed. Exactness does not depend on the guess.
+
+Tried, not kept:
+
+- Keys that also say which hand (not just which side) holds the top one, two or three
+  cards: 1.902 to 1.908 questions against 1.915 in the simulation, for tables two to four
+  times larger.
+- Lengths capped at 4 instead of 3: 1.913 against 1.915.
+
+Not done: narrowing the range with bounds before the first question. The quick-tricks and
+later-tricks bounds already answer such a question at once when it is asked, so they save a
+cheap question, not a search. What is left to gain is about 0.09 questions per position.

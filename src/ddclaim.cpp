@@ -15,6 +15,8 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -703,21 +705,48 @@ bool follow(int n, int L, int target, u64 all, u64 lane, u64 best, int bw, bool 
   return !cut;
 }
 
-// A first guess at North-South's tricks (a linear fit on six-card endings).
+#include "guess_tables.inc"
+
+// The first target to ask about. For 4 to 7 cards: an additive model fitted on random
+// endings (tools/guess/), one table entry per suit keyed on the leader-relative suit lengths
+// (capped at 3) and which side holds each of the suit's top four cards, plus a term for the
+// difference in trump length. It estimates the leader's side's tricks e; the first target
+// is floor(e) + 1, so that the two cheapest outcomes (the value is that target or one
+// less) straddle the estimate. The guess only chooses which questions are asked.
 template <bool NT>
 inline int guess(int n, int L) {
-  const u64 all = H[0] | H[1] | H[2] | H[3], ns = H[0] | H[2];
+  const u64 all = H[0] | H[1] | H[2] | H[3];
+  if (n >= 4 && n <= 7) {
+    const int16_t* w = kGuessW[n - 4][NT];
+    const u64 rot = std::rotr(LENS, 16 * L);  // nibble 4 * i + lane: the length in the i-th hand from the leader
+    const u64 side = H[L] | H[L ^ 2];
+    int e = 0;
+    for (int l = 0; l < 4; l++) {
+      const unsigned x = unsigned(all >> (16 * l)) & 0x1FFF;
+      const unsigned pm = _pext_u32(unsigned(side >> (16 * l)) & 0x1FFF, x);
+      const unsigned pat = ((pm << (16 - popc(x))) >> 12) & 15;  // the top four cards, highest in bit 3
+      const unsigned c0 = unsigned(rot >> (4 * l)) & 15, c1 = unsigned(rot >> (16 + 4 * l)) & 15;
+      const unsigned c2 = unsigned(rot >> (32 + 4 * l)) & 15, c3 = unsigned(rot >> (48 + 4 * l)) & 15;
+      const unsigned key = pat + 16 * ((c0 < 3 ? c0 : 3) + 4 * ((c1 < 3 ? c1 : 3) + 4 * ((c2 < 3 ? c2 : 3) + 4 * (c3 < 3 ? c3 : 3))));
+      const bool trump = !NT && l == 3;
+      e += w[(trump ? 4096 : 0) + key];
+      if (trump) e += w[8192 + 14 + int(c0 + c2) - int(c1 + c3)];
+    }
+    if (NT) e += w[8192 + 14];
+    if (L & 1) e = 64 * n - e;  // North-South's tricks, in 1/64
+    const int t = (e + 64) >> 6;
+    return t < 1 ? 1 : t > n ? n : t;
+  }
+  // Other sizes: a linear fit on top-card counts (made for six cards, scaled).
+  const u64 ns = H[0] | H[2];
   int c[3] = {0, 0, 0}, t[3] = {0, 0, 0};
   for (int l = 0; l < 4; l++) {
     u64 x = all & LANE(l);
     int* d = (!NT && l == 3) ? t : c;
-    int got = 0;
     for (int j = 0; j < 3 && x; j++) {
       u64 top = highest(x);
       x ^= top;
-      got += (top & ns) != 0;
       for (int i = j; i < 3; i++) d[i] += (top & ns) != 0;
-      (void)got;
     }
   }
   int e;  // hundredths of a trick
@@ -1590,6 +1619,14 @@ void init() {
   memset(g_plook, 0, sizeof g_plook), memset(g_phit, 0, sizeof g_phit);
   memset(g_n, 0, sizeof g_n), memset(g_fn, 0, sizeof g_fn), memset(g_first, 0, sizeof g_first), memset(g_tried, 0, sizeof g_tried);
 #endif
+}
+
+bool pin_thread(int cpu) {
+  if (cpu < 0 || cpu >= CPU_SETSIZE) return false;
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  CPU_SET(cpu, &set);
+  return pthread_setaffinity_np(pthread_self(), sizeof set, &set) == 0;
 }
 
 void solve(const Position* positions, size_t count, uint8_t* tricks) {

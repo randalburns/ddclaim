@@ -4,8 +4,8 @@ An exact double-dummy solver for small bridge endings, built to check claims on 
 positions: given the cards left, the trump suit and the hand on lead, how many tricks does
 each side take with best play?
 
-It handles endings of 1 to 7 cards per hand. A 6-card ending takes under 3 microseconds on
-one core, about 36 times faster than [DDS](https://github.com/dds-bridge/dds), and shorter
+It handles endings of 1 to 7 cards per hand. A 6-card ending takes about 2.6 microseconds on
+one core, about 39 times faster than [DDS](https://github.com/dds-bridge/dds), and shorter
 endings are faster still.
 
 ## Speed against DDS
@@ -20,10 +20,10 @@ answer was checked against an independent solver.
 | 1 | 18,800,000 | 53 ns | 101,000 | 185× |
 | 2 | 9,490,000 | 105 ns | 13,600 | 700× |
 | 3 | 12,800,000 | 78 ns | 13,300 | 960× |
-| 4 | 4,910,000 | 204 ns | 12,800 | 385× |
-| 5 | 1,280,000 | 781 ns | 11,600 | 110× |
-| 6 | 358,000 | 2.8 µs | 10,000 | 36× |
-| 7 | 105,000 | 9.5 µs | 7,670 | 14× |
+| 4 | 5,700,000 | 175 ns | 12,800 | 445× |
+| 5 | 1,350,000 | 740 ns | 11,600 | 116× |
+| 6 | 392,000 | 2.6 µs | 10,000 | 39× |
+| 7 | 111,000 | 9.0 µs | 7,670 | 14× |
 
 Most of the gap at these sizes is not search speed: DDS spends 60 to 70 microseconds
 setting up each call, which is nearly all of its time on a short ending, and ddclaim has no
@@ -51,8 +51,9 @@ endings that are already solved. `NOTES.md` is the design log, with what was mea
 what was tried and dropped.
 
 - **True/false search.** The search answers "can North-South take at least `t` tricks?".
-  The exact count comes from a few such questions; a fitted first guess at the answer keeps
-  that to about 2.2 questions per position.
+  The exact count comes from a few such questions; a first guess at the answer, from small
+  fitted tables (`src/guess_tables.inc`, made by `tools/guess/`), keeps that to about 1.9
+  questions per position.
 - **A hand in one word.** Each hand is a 64-bit word with 16 bits per suit, so one
   instruction works on all four suits. Runs of touching cards, which play alike, are found
   with bit-extract and bit-deposit instructions. The trump suit is always moved to the same
@@ -97,6 +98,7 @@ struct Position {
 int cards_per_hand(const Position& p);   // 1..7, or -1 if solve() cannot take the position
 void init();                             // once, before solving
 void solve(const Position* positions, size_t n, uint8_t* tricks);
+bool pin_thread(int cpu);                // optional: pin the calling thread to a CPU
 
 }
 ```
@@ -111,6 +113,7 @@ void solve(const Position* positions, size_t n, uint8_t* tricks);
   different sizes, more than 7 cards or none, a card held twice, or a trump or leader out
   of range. `solve` does not check.
 - **`init`** loads the tables, building them first if they are missing (see "Tables").
+- **`pin_thread`** pins the calling thread to one CPU; see "Threads".
 
 ### Calling it
 
@@ -160,15 +163,15 @@ Measured on random 6-card endings (`bin/batch_sizes 6 100000`):
 
 | Positions per call | Positions/s | Time each |
 |---:|---:|---:|
-| 1 | 206,000 | 4.8 µs |
-| 2 | 250,000 | 4.0 µs |
-| 4 | 298,000 | 3.4 µs |
-| 8 | 330,000 | 3.0 µs |
-| 16 | 347,000 | 2.9 µs |
-| 64 | 363,000 | 2.8 µs |
-| 1,000 or more | 367,000 | 2.7 µs |
+| 1 | 195,000 | 5.1 µs |
+| 2 | 231,000 | 4.3 µs |
+| 4 | 308,000 | 3.3 µs |
+| 8 | 345,000 | 2.9 µs |
+| 16 | 363,000 | 2.8 µs |
+| 64 | 383,000 | 2.6 µs |
+| 1,000 or more | 390,000 | 2.6 µs |
 
-At 4 cards the effect is larger: 2.5 million per second one at a time, 5.0 million in large
+At 4 cards the effect is larger: 2.6 million per second one at a time, 5.7 million in large
 batches.
 
 How to batch:
@@ -179,7 +182,7 @@ How to batch:
 - **Mix freely.** One batch may hold endings of different sizes, strains and leaders. There
   is no need to sort or group them.
 - **If positions arrive one at a time,** buffer them and flush when the buffer holds a few
-  dozen or when you need an answer. A single call still takes under 5 microseconds for six
+  dozen or when you need an answer. A single call still takes about 5 microseconds for six
   cards, so batching matters only when throughput does.
 - **To use several cores,** call `solve` from several threads, each with its own batch
   (see "Threads" below).
@@ -198,30 +201,24 @@ table, its stacks, its place in the batch) is kept per thread, about 2 MB each. 
 itself must be called once, from one thread, before any `solve`. Do not call `solve` from
 inside another `solve` on the same thread.
 
-`bin/threads` checks this: every thread's answers must equal those of a single thread. They
-did in every run.
+Pinning each thread to its own core can help: otherwise the operating system may put two
+of them on the same core. The library supports it with `ddclaim::pin_thread(cpu)`, called
+from the thread to be pinned.
 
-**Pin each thread to its own core.** Left to the operating system, four threads on this
-machine (4 fast cores, 8 slow ones, two threads per core) gave 2.4 times one thread; pinned
-to the four fast cores they gave 3.2 times. `bin/threads <cards> <positions> <threads>
-<cpus>` takes a list of CPU numbers to pin to.
+```cpp
+ddclaim::init();
+std::vector<std::thread> pool;
+for (int t = 0; t < threads; t++)
+  pool.emplace_back([&, t] {
+    ddclaim::pin_thread(t);        // optional: this thread runs on CPU t
+    ddclaim::solve(batch[t].data(), batch[t].size(), tricks[t].data());
+  });
+for (std::thread& th : pool) th.join();
+```
 
-| 6-card positions/s | One thread | 2 threads | 4 threads | 8 threads | 12 threads |
-|---|---:|---:|---:|---:|---:|
-| Pinned to the fast cores | 365,000 | 701,000 | 1,160,000 | 1,330,000 (both threads of each core) | |
-| Not pinned | 360,000 | | 860,000 | | 1,520,000 |
-
-Where the rest goes, measured per thread with four pinned threads against one:
-
-| | One thread | Four threads | Change |
-|---|---:|---:|---|
-| Clock speed of the core | 5.0 GHz | 4.2 to 4.4 GHz | 12 to 17% slower |
-| Cycles per position | 13,800 | 14,700 | 6% more |
-| Instructions, cache misses and TLB misses per position | | | unchanged |
-
-So most of the loss is the processor lowering its clock when four cores are busy, which no
-program can change. The threads themselves interfere by about 6%. Running more searches in
-turn per thread (12, 16 or 24 instead of 8) did not reduce that; it was slower.
+`bin/threads <cards> <positions> <threads> [cpus]` checks thread safety: every thread's
+answers must equal those of a single thread. With a comma-separated list of CPU numbers it
+pins the threads to them.
 
 ## Command line
 

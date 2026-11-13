@@ -49,4 +49,9 @@ void init();
 // per thread. Much faster per position on a batch than one position at a time: see README.md.
 void solve(const Position* positions, size_t n, uint8_t* tricks);
 
+// Pins the calling thread to one CPU (as numbered by the operating system); false if that
+// fails. Optional: when several threads call solve(), giving each its own core keeps them from
+// sharing one.
+bool pin_thread(int cpu);
+
 }  // namespace ddclaim
