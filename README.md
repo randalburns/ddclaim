@@ -5,13 +5,15 @@ positions: given the cards left, the trump suit and the hand on lead, how many t
 each side take with best play?
 
 It handles endings of 1 to 7 cards per hand. A 6-card ending takes about 2.6 microseconds on
-one core, about 39 times faster than [DDS](https://github.com/dds-bridge/dds), and shorter
-endings are faster still.
+one core, about 39 times faster than [DDS](https://github.com/dds-bridge/dds) on this specific workload. 
+
+_Note:_ DDS is designed to solve all strains from all seats. 
+
 
 ## Speed against DDS
 
 One core of an AMD Ryzen AI 9 HX 370. Positions are uniformly random (random cards, strain
-and leader), not seen before, with the tables already built. DDS is called the usual way:
+and leader), not seen before, with the tables already built. DDS is with
 one `SolveBoard` call per position for the exact trick count, on one thread. Every ddclaim
 answer was checked against an independent solver.
 
