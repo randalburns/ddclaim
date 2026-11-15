@@ -236,3 +236,33 @@ Tried, not kept:
 Not done: narrowing the range with bounds before the first question. The quick-tricks and
 later-tricks bounds already answer such a question at once when it is asked, so they save a
 cheap question, not a search. What is left to gain is about 0.09 questions per position.
+
+## The tables as a header (include/ddclaim/tables.hpp)
+
+ddfast (an exact solver for full deals) finishes its endings in these tables. Rather than
+keep a copy of the probes there, the tables are exported: the hand-word helpers, the table
+layout, `init_tables(dir, levels)`, and the 2-card, 3-card and pattern-table probes as inline
+function templates. The
+probe takes the coroutine switch as a callable, so ddclaim passes its `yield` and a caller
+without coroutines passes an empty lambda; a pattern probe returns the key it computed (for
+the filling search) and the index of the entry that answered (for hit counts). ddclaim's
+`lead` calls the same functions, so there is one copy.
+
+The table state the probes read (the flags, the small lookup arrays and the pointers to the
+tables) is declared in the header in an unnamed namespace, so every file that includes it has
+its own copy with internal linkage; a file other than ddclaim's fills its copy from
+`snapshot()` with `attach()`. A first version declared the state `extern`, with one
+definition in ddclaim.cpp: ddclaim became about 2% slower at seven cards (110-111k against
+113-114k positions/s, alternating runs), and declaring the same variables `static` again gave
+the speed back. With internal linkage the compiler knows nothing outside the file writes them,
+so it need not reload them after calls it cannot see into (the coroutine switch).
+
+Same answers (bench against altsolve), and the same speed within noise: six and seven cards,
+the old and the new binary alternating, pinned to CPU 0 (numbers in the commit message).
+
+Fixed at the same time: the path of the 3-card table was a global computed at start-up, so a
+program that set `DDCLAIM_DIR` in `main` (or later) before `init` still read, and if missing
+rebuilt, the table in the old directory. It is now computed when the table is loaded.
+`init(dir)` and `init_tables(dir, levels)` take the directory directly; `DDCLAIM_LEVELS` (which
+already chose the pattern levels) is documented, and with 1 only the 3-card and 4-card tables
+are built.

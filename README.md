@@ -99,6 +99,7 @@ struct Position {
 
 int cards_per_hand(const Position& p);   // 1..7, or -1 if solve() cannot take the position
 void init();                             // once, before solving
+void init(const char* dir);              // the same, with the table directory
 void solve(const Position* positions, size_t n, uint8_t* tricks);
 bool pin_thread(int cpu);                // optional: pin the calling thread to a CPU
 
@@ -115,6 +116,7 @@ bool pin_thread(int cpu);                // optional: pin the calling thread to 
   different sizes, more than 7 cards or none, a card held twice, or a trump or leader out
   of range. `solve` does not check.
 - **`init`** loads the tables, building them first if they are missing (see "Tables").
+  `init(dir)` reads them from `dir` instead of `$DDCLAIM_DIR`.
 - **`pin_thread`** pins the calling thread to one CPU; see "Threads".
 
 ### Calling it
@@ -292,9 +294,19 @@ Settings (environment variables):
 
 | Variable | Effect |
 |---|---|
-| `DDCLAIM_DIR` | Where the table files are read from and built. |
+| `DDCLAIM_DIR` | Where the table files are read from and built. Read by `init`, so a program may set it just before. |
+| `DDCLAIM_LEVELS` | How many levels of learned tables to use and build: 0 to 3 for the 4-, 5- and 6-card tables (default 2). `DDCLAIM_LEVELS=1` builds only the 3-card table and the 4-card table (about 1 GB of files instead of 2.6 GB). |
 | `DDCLAIM_MAP=1` | Memory-map the files instead of reading them in. Starts a little faster, but solves about 12% slower. |
 | `DDCLAIM_SECONDS` | Time allowed for filling the learned tables when building (default 170). Less gives smaller tables and a slower solver; the answers stay exact. |
+
+### Using the tables from another program
+
+`include/ddclaim/tables.hpp` exports the tables to programs that search larger positions
+themselves (as [ddfast](https://github.com/randalburns/ddfast) does for full deals): the
+hand-word helpers, the layout of the 2-card, 3-card and pattern tables, `init_tables(dir,
+levels)` to load or build them, and the probes. The probes are inline functions in the header,
+so they compile into the caller's search; ddclaim's own solver uses the same header. Link with
+ddclaim's `src/ddclaim.cpp`, which holds the table data.
 
 ## Checking it yourself
 

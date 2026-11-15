@@ -22,49 +22,14 @@
 #include <unistd.h>
 
 #include "ddclaim.hpp"
+#include "ddclaim/tables.hpp"
 
 namespace {
 
-typedef uint64_t u64;
-
-// A hand is a 64-bit word: suit s occupies bits 16s .. 16s+12 (bit 12 the ace).
-// The trump suit, if any, is always moved to lane 3.
-constexpr u64 LANE0 = 0x1FFF;
-constexpr u64 GUARD = 0x8000800080008000ull;
-constexpr u64 ONES = 0x0001000100010001ull;
-constexpr u64 ALL_LANES = 0x1FFF1FFF1FFF1FFFull;
-
-constexpr u64 LANE(int s) { return LANE0 << (16 * s); }
-inline u64 lane_of(u64 c) { return LANE0 << (__builtin_ctzll(c) & 48); }
-inline int suit_of(u64 c) { return __builtin_ctzll(c) >> 4; }
-inline u64 ge(u64 c) { return lane_of(c) & (0 - c); }       // c and everything above it in its suit
-inline u64 above(u64 c) { return ~((c << 1) - 1); }        // all bits above c (any lane)
-inline u64 lowest(u64 x) { return x & (0 - x); }
-inline u64 highest(u64 x) { return 1ull << (63 - __builtin_clzll(x)); }
-inline int popc(u64 x) { return __builtin_popcountll(x); }
-
-// For every lane: all bits at and above the lowest set bit.
-inline u64 fill_up(u64 x) {
-  u64 y = x | GUARD;
-  u64 low = y & ~(y - ONES);
-  return (GUARD - low) & ALL_LANES;
-}
-
-// One card per run of touching cards (the top one). `mine` is a subset of `present`.
-inline u64 heads(u64 mine, u64 present) {
-  u64 p = present | GUARD;
-  u64 pm = _pext_u64(mine, p);
-  return _pdep_u64(pm & ~(pm >> 1), p);
-}
-
-// The lowest card of the run of touching cards that `c` heads; `rest` is the hand without c.
-inline u64 run_bottom(u64 c, u64 rest, u64 present) {
-  u64 p = present | GUARD;
-  u64 pm = _pext_u64(rest, p), bc = _pext_u64(c, p);
-  u64 t = ~pm & (bc - 1);
-  u64 bb = 1ull << (64 - _lzcnt_u64(t));  // just above the highest gap below c, or bit 0
-  return _pdep_u64(bb, p);
-}
+// The hand-word helpers and the tables of solved endings, with their probes, are in
+// ddclaim/tables.hpp (shared with programs that use the tables).
+using namespace ddclaim::bits;
+using namespace ddclaim::tables;
 
 #ifdef DBG
 }
@@ -118,9 +83,6 @@ constexpr int TT_BITS = 10;
 #define TT_MIN_N 5
 #endif
 constexpr int TT_MIN = TT_MIN_N;
-#ifndef PCHUNK
-#define PCHUNK 8
-#endif
 #ifndef NCTX
 #define NCTX 8
 #endif
@@ -138,46 +100,8 @@ inline int len_of(int seat, int suit) { return int(LENS >> (16 * seat + 4 * suit
 template <bool NT, int K>
 bool follow(int n, int L, int target, u64 all, u64 lane, u64 best, int bw, bool ranked, u64& R);
 
-// Table of all two-card endings (leader-relative): [composition][nt][arrangement][target-1]
-// -> bit 8: the leader's side reaches the target; low 8 bits: the cards that matter.
-// Table of all three-card endings, leader-relative, side suits sorted by length:
-// [config][nt][arrangement] -> 5 bytes: bits 0-1 the leader's side's tricks, then for each
-// target 1..3 the 12 cards (in compressed order) that matter for that answer.
-constexpr size_t T3_ARR = 369600, T3_CFG = 102, T3_BYTES = T3_CFG * 2 * T3_ARR * 5;
-bool g_use3 = false;
-uint16_t g_r924[4096];
-uint8_t g_r20[64], g_cfg3[2197];
-uint8_t* g_t3;
-alignas(16) uint8_t g_shuf[8][16], g_unshuf[8][16];
 void yield();
 
-// Persistent pattern tables for endings of 4, 5 and 6 cards (level = cards - 4),
-// leader-relative with the side suits sorted. A directory maps the suit lengths of all four
-// hands (and the strain) to a run of groups of 8 entries. An entry is a pattern and bounds:
-// a = the owners of the cards that matter (two bits per card, split in two bit strings in
-// compressed order), b = those cards (the same mask under both bit strings), bits 56-58 and
-// 59-61 bounds on the leader's side's tricks, bit 63 set. An unused slot has a = ~0, b = 0.
-// A run stores its a's and then its b's (64 bytes per group each). The tables are filled in
-// init by solving random endings, then frozen.
-constexpr int P_LEVELS = 3;
-struct PDir {
-  u64 key;       // 0 marks an empty slot
-  uint32_t off;  // of the run, in units of 64 bytes
-  uint32_t groups;
-};
-struct PRec {
-  u64 key, a;
-  u64 b;
-};
-struct PTable {
-  bool use = false;
-  int dir_bits = 0;
-  PDir* dir = nullptr;
-  const u64* ent = nullptr;  // runs: the table file, memory-mapped
-  size_t lines = 0;          // 64-byte units in ent
-  uint16_t* cnt = nullptr;   // hit counts while filling (a mapped file): 4 per 64-byte unit
-};
-PTable g_pt[P_LEVELS];
 thread_local std::vector<PRec>* g_plog;  // new patterns while filling (one vector per level)
 #ifdef STATS
 }
@@ -185,9 +109,6 @@ extern unsigned long long g_plook[3], g_phit[3];
 namespace {
 #endif
 
-bool g_use2 = false;
-uint8_t g_r70[256], g_r6[16], g_comp[729];
-uint16_t* g_t2;
 
 template <bool NT>
 struct Cfg {
@@ -347,38 +268,8 @@ bool lead(int n, int L, int target, u64& R) {
   }
   const u64 all = H[0] | H[1] | H[2] | H[3];
   const bool cut = !(L & 1);
-  if (n == 2 && g_use2) {
-    const u64 h3 = H[(L + 3) & 3];
-    const unsigned lo = unsigned(_pext_u64(H[(L + 1) & 3] | h3, all)), hi = unsigned(_pext_u64(H[(L + 2) & 3] | h3, all));
-    const unsigned rank = g_r70[lo] * 36 + g_r6[_pext_u32(hi, lo)] * 6 + g_r6[_pext_u32(hi, lo ^ 0xFF)];
-    const unsigned comp = g_comp[popc(all & LANE(0)) + 9 * popc(all & LANE(1)) + 81 * popc(all & LANE(2))];
-    const int tl = cut ? target : 3 - target;
-    const uint16_t e = g_t2[((comp * 2 + NT) * 2520 + rank) * 2 + (tl - 1)];
-    R = fill_up(_pdep_u64(e & 0xFF, all));
-    return bool(e >> 8) == cut;
-  }
-  if (n == 3 && g_use3) {
-    const int p0 = popc(all & LANE(0)), p1 = popc(all & LANE(1)), p2 = popc(all & LANE(2));
-    const int pid = (p0 < p1) | (p0 < p2) << 1 | (p1 < p2) << 2;
-    const __m128i ctl = _mm_load_si128((const __m128i*)g_shuf[pid]);
-    const u64 h3 = H[(L + 3) & 3];
-    const u64 alls = u64(_mm_cvtsi128_si64(_mm_shuffle_epi8(_mm_cvtsi64_si128((long long)all), ctl)));
-    const u64 ews = u64(_mm_cvtsi128_si64(_mm_shuffle_epi8(_mm_cvtsi64_si128((long long)(H[(L + 1) & 3] | h3)), ctl)));
-    const u64 sws = u64(_mm_cvtsi128_si64(_mm_shuffle_epi8(_mm_cvtsi64_si128((long long)(H[(L + 2) & 3] | h3)), ctl)));
-    const unsigned lo = unsigned(_pext_u64(ews, alls)), hi = unsigned(_pext_u64(sws, alls));
-    const size_t rank = size_t(g_r924[lo]) * 400 + g_r20[_pext_u32(hi, lo)] * 20 + g_r20[_pext_u32(hi, lo ^ 0xFFF)];
-    const size_t cfg = g_cfg3[p0 + 13 * p1 + 169 * p2];
-    const uint8_t* addr = g_t3 + ((cfg * 2 + NT) * T3_ARR + rank) * 5;
-    _mm_prefetch((const char*)addr, _MM_HINT_T0);
-    _mm_prefetch((const char*)addr + 4, _MM_HINT_T0);
-    yield();
-    u64 e;
-    memcpy(&e, addr, 8);
-    const int tl = cut ? target : 4 - target;
-    const u64 m = _pdep_u64((e >> (12 * tl - 10)) & 0xFFF, alls);
-    R = fill_up(u64(_mm_cvtsi128_si64(_mm_shuffle_epi8(_mm_cvtsi64_si128((long long)m), _mm_load_si128((const __m128i*)g_unshuf[pid])))));
-    return (int(e & 3) >= tl) == cut;
-  }
+  if (n == 2 && g_use2) return probe2<NT>(H, L, all, target, R);
+  if (n == 3 && g_use3) return probe3<NT>(H, L, all, target, R, [] { yield(); });
   const int needL = cut ? target : n - target + 1;
   if (SW(1) && quick_tricks<NT>(L, needL, all, R)) {
     STAT(g_qt++);STAT(g_n[n][1]++);
@@ -421,64 +312,18 @@ bool lead(int n, int L, int target, u64& R) {
   }
 
   // Persistent pattern table.
-  u64 pkey = 0, palls = 0, pown = 0;
-  int ppid = 0;
+  PatternQuery pq;
   if (n >= 4 && n < 4 + P_LEVELS && g_pt[n - 4].use) {
-    const PTable& pt = g_pt[n - 4];
-    const u64 rot = std::rotr(LENS, 16 * L);
-    const u64 t0 = _pext_u64(rot, 0x000F000F000F000Full), t1 = _pext_u64(rot, 0x00F000F000F000F0ull);
-    const u64 t2 = _pext_u64(rot, 0x0F000F000F000F00ull), t3 = _pext_u64(rot, 0xF000F000F000F000ull);
-    const int c01 = t0 < t1, c02 = t0 < t2, c12 = t1 < t2;
-    ppid = c01 | c02 << 1 | c12 << 2;
-    pkey = t0 << (16 * (c01 + c02)) | t1 << (16 * (!c01 + c12)) | t2 << (16 * (!c02 + !c12)) | t3 << 48 | u64(NT) << 63;
-    size_t h = (pkey * 0x9E3779B97F4A7C15ull) >> (64 - pt.dir_bits);
-    _mm_prefetch((const char*)&pt.dir[h], _MM_HINT_T0);
-    yield();
-    const __m128i ctl = _mm_load_si128((const __m128i*)g_shuf[ppid]);
-    const u64 h3 = H[(L + 3) & 3];
-    palls = u64(_mm_cvtsi128_si64(_mm_shuffle_epi8(_mm_cvtsi64_si128((long long)all), ctl)));
-    const u64 ews = u64(_mm_cvtsi128_si64(_mm_shuffle_epi8(_mm_cvtsi64_si128((long long)(H[(L + 1) & 3] | h3)), ctl)));
-    const u64 sws = u64(_mm_cvtsi128_si64(_mm_shuffle_epi8(_mm_cvtsi64_si128((long long)(H[(L + 2) & 3] | h3)), ctl)));
-    pown = _pext_u64(ews, palls) | _pext_u64(sws, palls) << (4 * n);
     STAT(g_plook[n - 4]++);
-    while (pt.dir[h].key != pkey && pt.dir[h].key) h = (h + 1) & ((size_t(1) << pt.dir_bits) - 1);
-    if (pt.dir[h].key) {
-      const u64* ea = pt.ent + size_t(pt.dir[h].off) * 8;
-      const int groups = int(pt.dir[h].groups);
-      const u64* eb = ea + 8 * groups;
-      const int tl = cut ? target : n + 1 - target;
-      const __m512i vo = _mm512_set1_epi64((long long)pown), vt = _mm512_set1_epi64(tl);
-      for (int j = 0; j < groups; j++) {
-        if (j % PCHUNK == 0) {
-          const int je = j + PCHUNK < groups ? j + PCHUNK : groups;
-          for (int i = j; i < je; i++) {
-            _mm_prefetch((const char*)(ea + 8 * i), _MM_HINT_T0);
-            _mm_prefetch((const char*)(eb + 8 * i), _MM_HINT_T0);
-          }
-          yield();
-        }
-        // Entries that match and whose bounds decide the question, found without branches.
-        const __m512i vb = _mm512_load_si512(eb + 8 * j);
-        const unsigned k = _mm512_cmpeq_epi64_mask(_mm512_and_si512(vb, vo), _mm512_load_si512(ea + 8 * j));
-        const __m512i vlo = _mm512_and_si512(_mm512_srli_epi64(vb, 56), _mm512_set1_epi64(7));
-        const __m512i vhi = _mm512_and_si512(_mm512_srli_epi64(vb, 59), _mm512_set1_epi64(7));
-        const unsigned kd = k & (_mm512_cmpge_epi64_mask(vlo, vt) | _mm512_cmplt_epi64_mask(vhi, vt));
-        if (kd) {
-          {
-            const int i = __builtin_ctz(kd);
-            const u64 bb = eb[8 * j + i];
-            const int blo = int(bb >> 56) & 7;
-            const u64 mk = _pdep_u64(bb & ((1ull << (4 * n)) - 1), palls);
-            R = fill_up(u64(_mm_cvtsi128_si64(_mm_shuffle_epi8(_mm_cvtsi64_si128((long long)mk), _mm_load_si128((const __m128i*)g_unshuf[ppid])))));
-            STAT(g_phit[n - 4]++);
-            if (g_plog) {
-              uint16_t& c = pt.cnt[size_t(pt.dir[h].off) * 4 + size_t(8 * j + i)];
-              if (c != 0xFFFF) c++;
-            }
-            return (blo >= tl) == cut;
-          }
-        }
+    size_t hit;
+    const int r = probe_pattern<NT>(H, LENS, n, L, all, target, pq, R, hit, [] { yield(); });
+    if (r >= 0) {
+      STAT(g_phit[n - 4]++);
+      if (g_plog) {
+        uint16_t& c = g_pt[n - 4].cnt[hit];
+        if (c != 0xFFFF) c++;
       }
+      return r;
     }
   }
 
@@ -558,13 +403,13 @@ bool lead(int n, int L, int target, u64& R) {
   }
   R = Racc;
   // Store.
-  if (pkey && g_plog) {
-    const u64 rs = u64(_mm_cvtsi128_si64(_mm_shuffle_epi8(_mm_cvtsi64_si128((long long)Racc), _mm_load_si128((const __m128i*)g_shuf[ppid]))));
-    const u64 m = _pext_u64(rs, palls);
+  if (pq.key && g_plog) {
+    const u64 rs = shuffle_lanes(Racc, g_shuf[pq.pid]);
+    const u64 m = _pext_u64(rs, pq.alls);
     const int tl = cut ? target : n + 1 - target;
     const u64 bounds = res == cut ? u64(tl) << 56 | 7ull << 59 : u64(tl - 1) << 59;
     const u64 mm = m | m << (4 * n);
-    g_plog[n - 4].push_back({pkey, pown & mm, mm | bounds | 1ull << 63});
+    g_plog[n - 4].push_back({pq.key, pq.own & mm, mm | bounds | 1ull << 63});
   }
   if (n >= TT_MIN) {
     if (b.tag != tag || b.gen != g_gen) {
@@ -883,17 +728,13 @@ void build_t2() {
 // ---------------------------------------------------------------------------------------
 // The three-card table.
 // Where the table files live: $DDCLAIM_DIR, or build/ddclaim under the current directory.
-std::string table_dir() {
-  const char* d = getenv("DDCLAIM_DIR");
-  return d && *d ? d : "build/ddclaim";
-}
 void make_table_dir() {
   const std::string d = table_dir();
   for (size_t i = 1; i <= d.size(); i++)
     if (i == d.size() || d[i] == '/') mkdir(d.substr(0, i).c_str(), 0777);
 }
-const std::string T3_PATH_STR = table_dir() + "/t3_v2.bin";
-const char* const T3_PATH = T3_PATH_STR.c_str();
+// Computed when the table is loaded, not at start-up: the caller may set the directory first.
+std::string t3_path() { return table_dir() + "/t3_v2.bin"; }
 
 void build_t3_tables() {
   int c = 0;
@@ -1097,7 +938,7 @@ void build_t3() {
   g_t3 = static_cast<uint8_t*>(aligned_alloc(2u << 20, bytes));
   madvise(g_t3, bytes, MADV_HUGEPAGE);
   bool loaded = false;
-  if (FILE* f = fopen(T3_PATH, "rb")) {
+  if (FILE* f = fopen(t3_path().c_str(), "rb")) {
     loaded = fread(g_t3, 1, T3_BYTES, f) == T3_BYTES && fgetc(f) == EOF;
     fclose(f);
   }
@@ -1129,11 +970,11 @@ void build_t3() {
     for (auto& x : th) x.join();
     mkdir("build", 0777);
     make_table_dir();
-    std::string tmp = std::string(T3_PATH) + ".tmp" + std::to_string(getpid());
+    std::string tmp = t3_path() + ".tmp" + std::to_string(getpid());
     if (FILE* f = fopen(tmp.c_str(), "wb")) {
       bool ok = fwrite(g_t3, 1, T3_BYTES, f) == T3_BYTES;
       ok = fclose(f) == 0 && ok;
-      if (ok) rename(tmp.c_str(), T3_PATH);
+      if (ok) rename(tmp.c_str(), t3_path().c_str());
       else remove(tmp.c_str());
     }
   }
@@ -1516,8 +1357,9 @@ void p_save_index(int lv) {
 
 long env_long(const char* name, long dflt) { return getenv(name) ? atol(getenv(name)) : dflt; }
 
-void build_p() {
-  const int levels = int(env_long("DDCLAIM_LEVELS", 2));
+void build_p(int levels) {
+  if (levels < 0) levels = 0;
+  if (levels > P_LEVELS) levels = P_LEVELS;
   if (!getenv("DDCLAIM_WARM")) {
     bool ok = true;
     for (int lv = 0; lv < levels; lv++) ok = ok && p_load(lv);
@@ -1608,12 +1450,42 @@ void build_p() {
 }  // namespace
 
 namespace ddclaim {
+namespace tables {
 
+void snapshot(Snapshot& out) {
+  out.use2 = g_use2;
+  memcpy(out.r70, g_r70, sizeof g_r70), memcpy(out.r6, g_r6, sizeof g_r6), memcpy(out.comp, g_comp, sizeof g_comp);
+  out.t2 = g_t2;
+  out.use3 = g_use3;
+  memcpy(out.r924, g_r924, sizeof g_r924), memcpy(out.r20, g_r20, sizeof g_r20), memcpy(out.cfg3, g_cfg3, sizeof g_cfg3);
+  out.t3 = g_t3;
+  memcpy(out.shuf, g_shuf, sizeof g_shuf), memcpy(out.unshuf, g_unshuf, sizeof g_unshuf);
+  for (int i = 0; i < P_LEVELS; i++) out.pt[i] = g_pt[i];
+}
 
-void init() {
+namespace {
+std::string g_dir;  // set by init_tables(); empty: $DDCLAIM_DIR or the default
+}
+
+std::string table_dir() {
+  if (!g_dir.empty()) return g_dir;
+  const char* d = getenv("DDCLAIM_DIR");
+  return d && *d ? d : "build/ddclaim";
+}
+
+void init_tables(const char* dir, int pattern_levels) {
+  if (dir && *dir) g_dir = dir;
   build_t2();
   build_t3();
-  build_p();
+  build_p(pattern_levels);
+}
+
+}  // namespace tables
+
+void init() { init(nullptr); }
+
+void init(const char* dir) {
+  tables::init_tables(dir, int(env_long("DDCLAIM_LEVELS", 2)));
 #ifdef STATS
   g_nodes = g_leads = g_queries = g_tthit = g_qt = g_lt = g_ttlook = 0;
   memset(g_plook, 0, sizeof g_plook), memset(g_phit, 0, sizeof g_phit);

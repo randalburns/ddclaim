@@ -37,10 +37,14 @@ inline int cards_per_hand(const Position& p) {
   return n[0];
 }
 
-// Call once, from one thread, before any solving. Loads the tables of solved endings from $DDCLAIM_DIR (default
-// build/ddclaim under the current directory), building them first if they are missing: about
-// 3 minutes on many threads and 2.6 GB of files, once.
+// Call once, from one thread, before any solving. Loads the tables of solved endings from
+// `dir`, or if it is null or empty from $DDCLAIM_DIR (default build/ddclaim under the current
+// directory), building them first if they are missing: about 3 minutes on many threads and
+// 2.6 GB of files, once. $DDCLAIM_LEVELS (default 2) sets how many pattern-table levels are
+// used (0 to 3: the 4-, 5- and 6-card tables). The tables themselves, with inline probes, are
+// exported in ddclaim/tables.hpp.
 void init();
+void init(const char* dir);
 
 // Solves positions[0..n): tricks[i] gets the tricks North-South take in positions[i]. Every
 // position must be valid (cards_per_hand() >= 1); the positions of a batch may differ in size.
