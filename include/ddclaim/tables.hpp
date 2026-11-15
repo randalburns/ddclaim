@@ -10,11 +10,12 @@
 //     least `target` tricks", with the set of cards that decided it. They are in this header
 //     so that they inline into the caller's search; ddclaim's own solver uses the same code.
 //
-// Requires an x86-64 CPU with AVX-512 and BMI2 (build with -march=native or the equivalent).
+// Requires an x86-64 CPU with AVX-512 and BMI2 (build with -march=native or the equivalent),
+// or AArch64 (Apple silicon; see port.hpp).
 // Link with ddclaim (src/ddclaim.cpp), which holds the table data and init_tables().
 #pragma once
 
-#include <immintrin.h>
+#include "ddclaim/port.hpp"
 
 #include <bit>
 #include <cstddef>
@@ -53,25 +54,13 @@ inline u64 fill_up(u64 x) {
 }
 
 // One card per run of touching cards (the top one). `mine` is a subset of `present`.
-inline u64 heads(u64 mine, u64 present) {
-  u64 p = present | GUARD;
-  u64 pm = _pext_u64(mine, p);
-  return _pdep_u64(pm & ~(pm >> 1), p);
-}
+inline u64 heads(u64 mine, u64 present) { return ddport::run_heads(mine, present); }
 
 // The lowest card of the run of touching cards that `c` heads; `rest` is the hand without c.
-inline u64 run_bottom(u64 c, u64 rest, u64 present) {
-  u64 p = present | GUARD;
-  u64 pm = _pext_u64(rest, p), bc = _pext_u64(c, p);
-  u64 t = ~pm & (bc - 1);
-  u64 bb = 1ull << (64 - _lzcnt_u64(t));  // just above the highest gap below c, or bit 0
-  return _pdep_u64(bb, p);
-}
+inline u64 run_bottom(u64 c, u64 rest, u64 present) { return ddport::run_bottom_of(c, rest, present); }
 
 // Moves the lanes of x by a byte shuffle (g_shuf / g_unshuf below).
-inline u64 shuffle_lanes(u64 x, const uint8_t* ctl) {
-  return u64(_mm_cvtsi128_si64(_mm_shuffle_epi8(_mm_cvtsi64_si128((long long)x), _mm_load_si128((const __m128i*)ctl))));
-}
+inline u64 shuffle_lanes(u64 x, const uint8_t* ctl) { return ddport::shuf8(x, ctl); }
 
 }  // namespace bits
 
@@ -195,12 +184,13 @@ inline bool probe2(const u64* H, int L, u64 all, int target, u64& R) {
   using namespace bits;
   const bool cut = !(L & 1);
   const u64 h3 = H[(L + 3) & 3];
-  const unsigned lo = unsigned(_pext_u64(H[(L + 1) & 3] | h3, all)), hi = unsigned(_pext_u64(H[(L + 2) & 3] | h3, all));
-  const unsigned rank = g_r70[lo] * 36 + g_r6[_pext_u32(hi, lo)] * 6 + g_r6[_pext_u32(hi, lo ^ 0xFF)];
+  const ddport::BitMask am(all);
+  const unsigned lo = unsigned(am.ext(H[(L + 1) & 3] | h3)), hi = unsigned(am.ext(H[(L + 2) & 3] | h3));
+  const unsigned rank = g_r70[lo] * 36 + g_r6[ddport::pext16(hi, lo)] * 6 + g_r6[ddport::pext16(hi, lo ^ 0xFF)];
   const unsigned comp = g_comp[popc(all & LANE(0)) + 9 * popc(all & LANE(1)) + 81 * popc(all & LANE(2))];
   const int tl = cut ? target : 3 - target;
   const uint16_t e = g_t2[((comp * 2 + NT) * 2520 + rank) * 2 + (tl - 1)];
-  R = fill_up(_pdep_u64(e & 0xFF, all));
+  R = fill_up(am.dep(e & 0xFF));
   return bool(e >> 8) == cut;
 }
 
@@ -211,22 +201,23 @@ inline bool probe3(const u64* H, int L, u64 all, int target, u64& R, Pause&& pau
   const bool cut = !(L & 1);
   const int p0 = popc(all & LANE(0)), p1 = popc(all & LANE(1)), p2 = popc(all & LANE(2));
   const int pid = (p0 < p1) | (p0 < p2) << 1 | (p1 < p2) << 2;
-  const __m128i ctl = _mm_load_si128((const __m128i*)g_shuf[pid]);
+  const uint8_t* ctl = g_shuf[pid];
   const u64 h3 = H[(L + 3) & 3];
-  const u64 alls = u64(_mm_cvtsi128_si64(_mm_shuffle_epi8(_mm_cvtsi64_si128((long long)all), ctl)));
-  const u64 ews = u64(_mm_cvtsi128_si64(_mm_shuffle_epi8(_mm_cvtsi64_si128((long long)(H[(L + 1) & 3] | h3)), ctl)));
-  const u64 sws = u64(_mm_cvtsi128_si64(_mm_shuffle_epi8(_mm_cvtsi64_si128((long long)(H[(L + 2) & 3] | h3)), ctl)));
-  const unsigned lo = unsigned(_pext_u64(ews, alls)), hi = unsigned(_pext_u64(sws, alls));
-  const size_t rank = size_t(g_r924[lo]) * 400 + g_r20[_pext_u32(hi, lo)] * 20 + g_r20[_pext_u32(hi, lo ^ 0xFFF)];
+  const u64 alls = ddport::shuf8(all, ctl);
+  const u64 ews = ddport::shuf8((H[(L + 1) & 3] | h3), ctl);
+  const u64 sws = ddport::shuf8((H[(L + 2) & 3] | h3), ctl);
+  const ddport::BitMask am(alls);
+  const unsigned lo = unsigned(am.ext(ews)), hi = unsigned(am.ext(sws));
+  const size_t rank = size_t(g_r924[lo]) * 400 + g_r20[ddport::pext16(hi, lo)] * 20 + g_r20[ddport::pext16(hi, lo ^ 0xFFF)];
   const size_t cfg = g_cfg3[p0 + 13 * p1 + 169 * p2];
   const uint8_t* addr = g_t3 + ((cfg * 2 + NT) * T3_ARR + rank) * 5;
-  _mm_prefetch((const char*)addr, _MM_HINT_T0);
-  _mm_prefetch((const char*)addr + 4, _MM_HINT_T0);
+  ddport::prefetch(addr);
+  ddport::prefetch(addr + 4);
   pause();
   u64 e;
   memcpy(&e, addr, 8);
   const int tl = cut ? target : 4 - target;
-  const u64 m = _pdep_u64((e >> (12 * tl - 10)) & 0xFFF, alls);
+  const u64 m = am.dep((e >> (12 * tl - 10)) & 0xFFF);
   R = fill_up(shuffle_lanes(m, g_unshuf[pid]));
   return (int(e & 3) >= tl) == cut;
 }
@@ -247,47 +238,43 @@ inline int probe_pattern(const u64* H, u64 lens, int n, int L, u64 all, int targ
   const bool cut = !(L & 1);
   const PTable& pt = g_pt[n - 4];
   const u64 rot = std::rotr(lens, 16 * L);
-  const u64 t0 = _pext_u64(rot, 0x000F000F000F000Full), t1 = _pext_u64(rot, 0x00F000F000F000F0ull);
-  const u64 t2 = _pext_u64(rot, 0x0F000F000F000F00ull), t3 = _pext_u64(rot, 0xF000F000F000F000ull);
+  const u64 t0 = ddport::lane_nibbles(rot, 0), t1 = ddport::lane_nibbles(rot, 1);
+  const u64 t2 = ddport::lane_nibbles(rot, 2), t3 = ddport::lane_nibbles(rot, 3);
   const int c01 = t0 < t1, c02 = t0 < t2, c12 = t1 < t2;
   q.pid = c01 | c02 << 1 | c12 << 2;
   q.key = t0 << (16 * (c01 + c02)) | t1 << (16 * (!c01 + c12)) | t2 << (16 * (!c02 + !c12)) | t3 << 48 | u64(NT) << 63;
   size_t h = (q.key * 0x9E3779B97F4A7C15ull) >> (64 - pt.dir_bits);
-  _mm_prefetch((const char*)&pt.dir[h], _MM_HINT_T0);
+  ddport::prefetch(&pt.dir[h]);
   pause();
-  const __m128i ctl = _mm_load_si128((const __m128i*)g_shuf[q.pid]);
+  const uint8_t* ctl = g_shuf[q.pid];
   const u64 h3 = H[(L + 3) & 3];
-  q.alls = u64(_mm_cvtsi128_si64(_mm_shuffle_epi8(_mm_cvtsi64_si128((long long)all), ctl)));
-  const u64 ews = u64(_mm_cvtsi128_si64(_mm_shuffle_epi8(_mm_cvtsi64_si128((long long)(H[(L + 1) & 3] | h3)), ctl)));
-  const u64 sws = u64(_mm_cvtsi128_si64(_mm_shuffle_epi8(_mm_cvtsi64_si128((long long)(H[(L + 2) & 3] | h3)), ctl)));
-  q.own = _pext_u64(ews, q.alls) | _pext_u64(sws, q.alls) << (4 * n);
+  q.alls = ddport::shuf8(all, ctl);
+  const u64 ews = ddport::shuf8((H[(L + 1) & 3] | h3), ctl);
+  const u64 sws = ddport::shuf8((H[(L + 2) & 3] | h3), ctl);
+  const ddport::BitMask am(q.alls);
+  q.own = am.ext(ews) | am.ext(sws) << (4 * n);
   while (pt.dir[h].key != q.key && pt.dir[h].key) h = (h + 1) & ((size_t(1) << pt.dir_bits) - 1);
   if (!pt.dir[h].key) return -1;
   const u64* ea = pt.ent + size_t(pt.dir[h].off) * 8;
   const int groups = int(pt.dir[h].groups);
   const u64* eb = ea + 8 * groups;
   const int tl = cut ? target : n + 1 - target;
-  const __m512i vo = _mm512_set1_epi64((long long)q.own), vt = _mm512_set1_epi64(tl);
   for (int j = 0; j < groups; j++) {
     if (j % P_CHUNK == 0) {
       const int je = j + P_CHUNK < groups ? j + P_CHUNK : groups;
       for (int i = j; i < je; i++) {
-        _mm_prefetch((const char*)(ea + 8 * i), _MM_HINT_T0);
-        _mm_prefetch((const char*)(eb + 8 * i), _MM_HINT_T0);
+        ddport::prefetch((ea + 8 * i));
+        ddport::prefetch((eb + 8 * i));
       }
       pause();
     }
     // Entries that match and whose bounds decide the question, found without branches.
-    const __m512i vb = _mm512_load_si512(eb + 8 * j);
-    const unsigned k = _mm512_cmpeq_epi64_mask(_mm512_and_si512(vb, vo), _mm512_load_si512(ea + 8 * j));
-    const __m512i vlo = _mm512_and_si512(_mm512_srli_epi64(vb, 56), _mm512_set1_epi64(7));
-    const __m512i vhi = _mm512_and_si512(_mm512_srli_epi64(vb, 59), _mm512_set1_epi64(7));
-    const unsigned kd = k & (_mm512_cmpge_epi64_mask(vlo, vt) | _mm512_cmplt_epi64_mask(vhi, vt));
+    const unsigned kd = ddport::pmatch8(ea + 8 * j, eb + 8 * j, q.own, tl);
     if (kd) {
       const int i = __builtin_ctz(kd);
       const u64 bb = eb[8 * j + i];
       const int blo = int(bb >> 56) & 7;
-      const u64 mk = _pdep_u64(bb & ((1ull << (4 * n)) - 1), q.alls);
+      const u64 mk = am.dep(bb & ((1ull << (4 * n)) - 1));
       R = fill_up(shuffle_lanes(mk, g_unshuf[q.pid]));
       hit = size_t(pt.dir[h].off) * 4 + size_t(8 * j + i);
       return (blo >= tl) == cut;

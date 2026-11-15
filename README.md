@@ -40,7 +40,9 @@ per-position setup. These are figures for large batches; see "Batching" for sing
   tool refuses those that are not.
 - **The start of a trick only.** Every hand holds the same number of cards and nobody has
   played to the current trick.
-- **x86-64 with AVX-512 and BMI2, Linux.** It will not build for older x86 CPUs or for Arm.
+- **x86-64 with AVX-512 and BMI2 on Linux, or Apple silicon on macOS.** It will not build
+  for older x86 CPUs. On Arm, `include/ddclaim/port.hpp` supplies NEON code for the AVX-512
+  parts and table lookups for pext and pdep (see "Building").
 - **`init` once, from one thread.** After that `solve` may be called from several threads
   at once.
 - **Tables:** 2.6 GB on disk, about 2.8 GB in memory while solving, and about 3 minutes
@@ -279,6 +281,16 @@ scripts/build.sh
 This makes `bin/ddclaim` (the command), `bin/bench` (timing and checking),
 `bin/batch_sizes` and `bin/threads`. It needs a C++20 compiler (clang++ by default; set `CXX` to change it)
 and a CPU with AVX-512 and BMI2, because it compiles with `-march=native`.
+
+On macOS (Apple silicon, with the Xcode Command Line Tools: `xcode-select --install`) the same
+command works: the script sees `arm64` and compiles with `-mcpu=native`, adding the CSSC
+instructions (scalar popcount and count-trailing-zeros) when `sysctl hw.optional.arm.FEAT_CSSC`
+reports them, since Apple clang may know a new CPU only by an older name. The bit and vector
+operations then come from `include/ddclaim/port.hpp`: NEON in place of AVX-512, byte-table
+lookups in place of pext and pdep. macOS has no huge pages or `MAP_POPULATE` (the pattern
+tables are mapped with 16 KB pages and read through once at load), and cannot pin threads
+(`pin_thread` asks for the performance cores by quality-of-service class and returns false).
+The answers are the same: `bin/bench` checks every answer against altsolve.
 
 ## Tables
 

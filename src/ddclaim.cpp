@@ -1,6 +1,6 @@
 // ddclaim: an exact double-dummy solver for small endings (a lean scalar zero-window search
 // over tables of solved endings). See README.md for use and NOTES.md for the design.
-#include <immintrin.h>
+#include "ddclaim/port.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -17,12 +17,34 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "ddclaim.hpp"
 #include "ddclaim/tables.hpp"
+
+namespace ddport {
+bool pin_to_cpu(int cpu) {
+#if defined(__linux__)
+  if (cpu < 0 || cpu >= CPU_SETSIZE) return false;
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  CPU_SET(cpu, &set);
+  return pthread_setaffinity_np(pthread_self(), sizeof set, &set) == 0;
+#elif defined(__APPLE__)
+  (void)cpu;
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+  return false;
+#else
+  (void)cpu;
+  return false;
+#endif
+}
+}  // namespace ddport
 
 namespace {
 
@@ -118,13 +140,13 @@ struct Cfg {
 // Count of the consecutive top cards of `lane` held by `mine` (subset of xs), and those cards.
 inline int tops(u64 ml, u64 xs, u64& topset) {
   u64 oth = xs ^ ml;
-  topset = ml & ~((1ull << (64 - _lzcnt_u64(oth))) - 1);  // above the highest other card
+  topset = ml & ~((1ull << (64 - ddport::clz64(oth))) - 1);  // above the highest other card
   return popc(topset);
 }
 
 // The j-th highest card of `set` and above (j >= 1, j <= popcount).
 inline u64 top_j(u64 set, int j) {
-  return ge(_pdep_u64(1ull << (popc(set) - j), set));
+  return ge(ddport::pdep64(1ull << (popc(set) - j), set));
 }
 
 // Sure tricks the leader can cash at once. True if at least `need`; R gets the cards that matter.
@@ -283,13 +305,11 @@ bool lead(int n, int L, int target, u64& R) {
   // Table.
   const u64 tag = LENS | u64(L & 1) << 3 | u64(L >> 1) << 7;
   Bucket& b = bucket_for(tag);
-  const u64 own = _pext_u64(H[1] | H[3], all) | _pext_u64(H[2] | H[3], all) << 28;
+  const u64 own = ddport::pext64(H[1] | H[3], all) | ddport::pext64(H[2] | H[3], all) << 28;
   u64 hint = 0;
   STAT(g_ttlook++);
   if (n >= TT_MIN && SW(4) && b.tag == tag && b.gen == g_gen) {
-    unsigned k = _mm512_cmpeq_epi64_mask(
-                     _mm512_and_si512(_mm512_load_si512(b.mask), _mm512_set1_epi64((long long)own)),
-                     _mm512_load_si512(b.val)) &
+    unsigned k = ddport::match8(b.mask, b.val, own) &
                  ((1u << b.cnt) - 1);
     while (k) {
       int i = __builtin_ctz(k);
@@ -298,17 +318,17 @@ bool lead(int n, int L, int target, u64& R) {
       if (b.lo[i] >= target || b.hi[i] < target) dbg_hit(H, L, NT, target, b.lo[i] >= target, b.mask[i], own, all, n);
 #endif
       if (b.lo[i] >= target) {
-        R = fill_up(_pdep_u64(b.mask[i] & 0xFFFFFFF, all));
+        R = fill_up(ddport::pdep64(b.mask[i] & 0xFFFFFFF, all));
         STAT(g_tthit++);STAT(g_n[n][3]++);
         return true;
       }
       if (b.hi[i] < target) {
-        R = fill_up(_pdep_u64(b.mask[i] & 0xFFFFFFF, all));
+        R = fill_up(ddport::pdep64(b.mask[i] & 0xFFFFFFF, all));
         STAT(g_tthit++);STAT(g_n[n][3]++);
         return false;
       }
     }
-    if (b.hint < 64) hint = _pdep_u64(1ull << b.hint, all);
+    if (b.hint < 64) hint = ddport::pdep64(1ull << b.hint, all);
   }
 
   // Persistent pattern table.
@@ -373,11 +393,7 @@ bool lead(int n, int L, int target, u64& R) {
 #endif
   while (cand) {
     // The best remaining card (highest score, then earliest), chosen without branches.
-    const __mmask16 live = __mmask16(_mm512_test_epi64_mask(_mm512_load_si512(cards), _mm512_set1_epi64((long long)cand)) |
-                                     _mm512_test_epi64_mask(_mm512_load_si512(cards + 8), _mm512_set1_epi64((long long)cand)) << 8);
-    const __m256i kv = _mm256_maskz_mov_epi16(live, _mm256_load_si256((const __m256i*)key));
-    const __m128i mx = _mm_max_epu16(_mm256_castsi256_si128(kv), _mm256_extracti128_si256(kv, 1));
-    const unsigned bk = 0xFFFF - unsigned(_mm_extract_epi16(_mm_minpos_epu16(_mm_xor_si128(mx, _mm_set1_epi16(-1))), 0));
+    const unsigned bk = ddport::best_key(cards, key, cand);
     const u64 c = cards[15 - (bk & 15)];
     cand ^= c;
     const int sh = 16 * L + 4 * suit_of(c);
@@ -405,7 +421,7 @@ bool lead(int n, int L, int target, u64& R) {
   // Store.
   if (pq.key && g_plog) {
     const u64 rs = shuffle_lanes(Racc, g_shuf[pq.pid]);
-    const u64 m = _pext_u64(rs, pq.alls);
+    const u64 m = ddport::pext64(rs, pq.alls);
     const int tl = cut ? target : n + 1 - target;
     const u64 bounds = res == cut ? u64(tl) << 56 | 7ull << 59 : u64(tl - 1) << 59;
     const u64 mm = m | m << (4 * n);
@@ -420,7 +436,7 @@ bool lead(int n, int L, int target, u64& R) {
       b.hint = 255;
     }
     if (bestc) b.hint = uint8_t(popc(all & (bestc - 1)));
-    const u64 m28 = _pext_u64(Racc, all);
+    const u64 m28 = ddport::pext64(Racc, all);
     const u64 mask = m28 | m28 << 28;
     const u64 val = own & mask;
     int i;
@@ -449,7 +465,7 @@ inline u64 min_rank(u64 cand) {
   int br = 99;
   for (int l = 0; l < 4; l++) {
     const u64 x = cand & LANE(l);
-    const int r = x ? int(_tzcnt_u64(x)) & 15 : 99;
+    const int r = x ? int(ddport::ctz64(x)) & 15 : 99;
     const bool lower = r < br;
     br = lower ? r : br;
     best = lower ? lowest(x) : best;
@@ -568,7 +584,7 @@ inline int guess(int n, int L) {
     int e = 0;
     for (int l = 0; l < 4; l++) {
       const unsigned x = unsigned(all >> (16 * l)) & 0x1FFF;
-      const unsigned pm = _pext_u32(unsigned(side >> (16 * l)) & 0x1FFF, x);
+      const unsigned pm = ddport::pext32(unsigned(side >> (16 * l)) & 0x1FFF, x);
       const unsigned pat = ((pm << (16 - popc(x))) >> 12) & 15;  // the top four cards, highest in bit 3
       const unsigned c0 = unsigned(rot >> (4 * l)) & 15, c1 = unsigned(rot >> (16 + 4 * l)) & 15;
       const unsigned c2 = unsigned(rot >> (32 + 4 * l)) & 15, c3 = unsigned(rot >> (48 + 4 * l)) & 15;
@@ -685,7 +701,7 @@ void build_t2() {
             if (popc(a) != 2) continue;
             for (unsigned b = 0; b < 16; b++) {
               if (popc(b) != 2) continue;
-              const unsigned hi = _pdep_u32(a, lo) | _pdep_u32(b, lo ^ 0xFF);
+              const unsigned hi = ddport::pdep32(a, lo) | ddport::pdep32(b, lo ^ 0xFF);
               const unsigned rank = g_r70[lo] * 36 + g_r6[a] * 6 + g_r6[b];
               u64 h[4] = {0, 0, 0, 0}, lens = 0;
               for (int i = 0; i < 8; i++) {
@@ -703,7 +719,7 @@ void build_t2() {
                   g_gen++;
                   u64 R;
                   bool res = nt ? lead<true>(2, 0, t, R) : lead<false>(2, 0, t, R);
-                  g_t2[((comp * 2 + nt) * 2520 + rank) * 2 + (t - 1)] = uint16_t(_pext_u64(R, all) | (res ? 256 : 0));
+                  g_t2[((comp * 2 + nt) * 2520 + rank) * 2 + (t - 1)] = uint16_t(ddport::pext64(R, all) | (res ? 256 : 0));
                 }
             }
           }
@@ -785,7 +801,7 @@ void gen_t3_part(int cfg, unsigned lo) {
     if (popc(a) != 3) continue;
     for (unsigned b = 0; b < 64; b++) {
       if (popc(b) != 3) continue;
-      const unsigned hi = _pdep_u32(a, lo) | _pdep_u32(b, lo ^ 0xFFF);
+      const unsigned hi = ddport::pdep32(a, lo) | ddport::pdep32(b, lo ^ 0xFFF);
       const size_t rank = size_t(g_r924[lo]) * 400 + g_r20[a] * 20 + g_r20[b];
       u64 h[4] = {0, 0, 0, 0}, lens = 0;
       for (int i = 0; i < 12; i++) {
@@ -803,7 +819,7 @@ void gen_t3_part(int cfg, unsigned lo) {
           u64 R;
           bool res = nt ? lead<true>(3, 0, t, R) : lead<false>(3, 0, t, R);
           v += res;
-          e |= _pext_u64(R, all) << (12 * t - 10);
+          e |= ddport::pext64(R, all) << (12 * t - 10);
         }
         e |= u64(v);
         memcpy(g_t3 + ((size_t(cfg) * 2 + nt) * T3_ARR + rank) * 5, &e, 5);
@@ -831,7 +847,7 @@ void minimize_t3(int cfg) {
         if (popc(b) != 3) continue;
         const size_t rank = size_t(g_r924[l]) * 400 + g_r20[a] * 20 + g_r20[b];
         lo[rank] = uint16_t(l);
-        hi[rank] = uint16_t(_pdep_u32(a, l) | _pdep_u32(b, l ^ 0xFFF));
+        hi[rank] = uint16_t(ddport::pdep32(a, l) | ddport::pdep32(b, l ^ 0xFFF));
       }
     }
   }
@@ -892,7 +908,7 @@ void minimize_t3(int cfg) {
         nl |= (((1u << c1) - 1) << c0 | ((1u << c3) - 1) << (c0 + c1 + c2)) << o;
         nh |= (((1u << (c2 + c3)) - 1) << (c0 + c1)) << o;
       }
-      const uint32_t g = uint32_t(g_r924[nl]) * 400 + g_r20[_pext_u32(nh, nl)] * 20 + g_r20[_pext_u32(nh, nl ^ 0xFFF)];
+      const uint32_t g = uint32_t(g_r924[nl]) * 400 + g_r20[ddport::pext32(nh, nl)] * 20 + g_r20[ddport::pext32(nh, nl ^ 0xFFF)];
       gid[r] = g;
       f1[g] |= res[r];
       f0[g] |= uint8_t(~res[r]);
@@ -936,7 +952,9 @@ void build_t3() {
   enum_cfg3();
   const size_t bytes = (T3_BYTES + 16 + (2u << 20) - 1) & ~size_t((2u << 20) - 1);
   g_t3 = static_cast<uint8_t*>(aligned_alloc(2u << 20, bytes));
+#ifdef MADV_HUGEPAGE
   madvise(g_t3, bytes, MADV_HUGEPAGE);
+#endif
   bool loaded = false;
   if (FILE* f = fopen(t3_path().c_str(), "rb")) {
     loaded = fread(g_t3, 1, T3_BYTES, f) == T3_BYTES && fgetc(f) == EOF;
@@ -985,30 +1003,7 @@ void build_t3() {
 // Coroutines: several positions are searched in turn on one thread. A search that needs a
 // three-card table entry prefetches it and hands over to the next search, so the memory
 // access is over by the time it resumes.
-extern "C" void ddclaim_ctx_switch(void** save_sp, void* load_sp);
-asm(R"(
-.text
-.p2align 4
-.globl ddclaim_ctx_switch
-.type ddclaim_ctx_switch,@function
-ddclaim_ctx_switch:
-  pushq %rbp
-  pushq %rbx
-  pushq %r12
-  pushq %r13
-  pushq %r14
-  pushq %r15
-  movq %rsp, (%rdi)
-  movq %rsi, %rsp
-  popq %r15
-  popq %r14
-  popq %r13
-  popq %r12
-  popq %rbx
-  popq %rbp
-  ret
-.size ddclaim_ctx_switch, .-ddclaim_ctx_switch
-)");
+DDPORT_DEFINE_CTX_SWITCH(ddclaim_ctx_switch)
 
 constexpr int MAX_CTX = 64;
 constexpr size_t STACK_BYTES = 64 << 10;
@@ -1101,10 +1096,7 @@ void run_batch(const ddclaim::Position* positions, size_t count, uint8_t* tricks
     Ctx& c = g_ctx[i];
     c.next = (i + 1) % nctx;
     c.prev = (i + nctx - 1) % nctx;
-    void** top = reinterpret_cast<void**>(g_stacks + (i + 1) * STACK_BYTES);
-    top[-2] = reinterpret_cast<void*>(&ctx_main);  // the return address, 16-byte aligned
-    for (int k = 3; k <= 8; k++) top[-k] = nullptr;
-    c.sp = top - 8;
+    c.sp = ddport::init_stack(g_stacks + (i + 1) * STACK_BYTES, &ctx_main);
     save_state(c);
   }
   g_cur = 0;
@@ -1156,7 +1148,9 @@ std::vector<PClass> g_pclasses[P_LEVELS];  // sorted by key
 void* alloc_huge(size_t bytes) {
   bytes = (bytes + (2u << 20)) & ~size_t((2u << 20) - 1);
   void* p = aligned_alloc(2u << 20, bytes);
+#ifdef MADV_HUGEPAGE
   madvise(p, bytes, MADV_HUGEPAGE);
+#endif
   return p;
 }
 
@@ -1174,6 +1168,10 @@ void* map_file(const std::string& path, size_t bytes, bool writable) {
     return nullptr;
   }
   char* at = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(base) + huge - 1) & ~(huge - 1));
+#ifndef MAP_POPULATE
+#define MAP_POPULATE 0
+#define DDCLAIM_NO_POPULATE 1
+#endif
   void* p = mmap(at, bytes, writable ? PROT_READ | PROT_WRITE : PROT_READ, MAP_SHARED | MAP_FIXED | (writable ? 0 : MAP_POPULATE), fd, 0);
   close(fd);
   if (p == MAP_FAILED) {
@@ -1183,6 +1181,13 @@ void* map_file(const std::string& path, size_t bytes, bool writable) {
   if (at > base) munmap(base, size_t(at - base));
   char* end = at + ((bytes + 4095) & ~size_t(4095));
   if (base + span > end) munmap(end, size_t(base + span - end));
+#ifdef DDCLAIM_NO_POPULATE  // macOS: read the file in now, as MAP_POPULATE does
+  if (!writable) {
+    madvise(p, bytes, MADV_WILLNEED);
+    volatile char sink = 0;
+    for (size_t i = 0; i < bytes; i += 16384) sink = sink + static_cast<const char*>(p)[i];
+  }
+#endif
 #ifdef MADV_COLLAPSE
   if (!writable && !getenv("DDCLAIM_NOCOLLAPSE")) madvise(p, bytes & ~(huge - 1), MADV_COLLAPSE);  // best effort
 #endif
@@ -1493,13 +1498,7 @@ void init(const char* dir) {
 #endif
 }
 
-bool pin_thread(int cpu) {
-  if (cpu < 0 || cpu >= CPU_SETSIZE) return false;
-  cpu_set_t set;
-  CPU_ZERO(&set);
-  CPU_SET(cpu, &set);
-  return pthread_setaffinity_np(pthread_self(), sizeof set, &set) == 0;
-}
+bool pin_thread(int cpu) { return ddport::pin_to_cpu(cpu); }
 
 void solve(const Position* positions, size_t count, uint8_t* tricks) {
   run_batch(positions, count, tricks, NCTX);
