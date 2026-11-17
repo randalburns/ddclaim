@@ -1,5 +1,11 @@
 # ddclaim
 
+> **Archived.** ddclaim now lives inside [ddfast](https://github.com/randalburns/ddfast) as
+> `extern/ddclaim` (a git subtree of this repository's `main`, history kept), cut down to
+> the 2-, 3- and 4-card endgame tables and their builder that ddfast uses. The standalone
+> 1-7-card solver described below is no longer developed; this repository is kept as its
+> record.
+
 An exact double-dummy solver for small bridge endings, built to check claims on end
 positions: given the cards left, the trump suit and the hand on lead, how many tricks does
 each side take with best play?
